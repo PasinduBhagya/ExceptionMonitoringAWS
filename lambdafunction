@@ -1,0 +1,175 @@
+import os
+import boto3
+import tarfile
+import re
+import requests
+import json
+from requests.auth import HTTPBasicAuth
+from datetime import datetime
+
+
+def extractingTarFile(logFileName, bucketName):
+    downloadPath = '/tmp/downloadedFiles/'
+    extractedPath = '/tmp/extractedFiles/'
+    
+    downloadFilePath = os.path.join(downloadPath, logFileName.split('/')[-1])
+
+    try:
+        os.makedirs(downloadPath, exist_ok=True)
+        os.makedirs(extractedPath, exist_ok=True)
+        print("Info: Directory creation successful")
+    except Exception as e:
+        print(f"Error: Failed to create the directories. Reason: {e}")
+        exit()
+
+    try:
+        s3Client = boto3.client('s3')
+        print(f"Info: Downloading file {logFileName} from bucket {bucketName} to {downloadFilePath}")
+        s3Client.download_file(bucketName, logFileName, downloadFilePath)
+        print("Info: File was downloaded successfully")
+        
+        if not os.path.isfile(downloadFilePath):
+            raise FileNotFoundError(f"Error: The downloaded file does not exist at {downloadFilePath}")
+        
+    except Exception as e:
+        print(f"Error: Failed to download the file. Reason: {e}")
+        exit()
+
+    try:
+        with tarfile.open(downloadFilePath) as logFile:
+            for fileName in logFile.getmembers():
+                if fileName.name.split(".")[-1] == "log":
+                    print(f"Info: Extracting {fileName.name}")
+                    logFile.extract(fileName, extractedPath)
+        print("Info: Log files extracted successfully")
+        
+        logFiles = [f for f in os.listdir(extractedPath) if f.endswith(".log")]
+        for logFile in logFiles:
+            logFilePath = os.path.join(extractedPath, logFile)
+            print(f"Info: Processing log file: {logFilePath}")
+            readLogFileExceptions(logFilePath)
+        
+    except Exception as e:
+        print(f"Error: Failed to extract the files. Reason: {e}")
+        exit()
+
+
+def readLogFileExceptions(logFilePath):
+    exceptionRegularExpression = re.compile(r'\b([A-Za-z0-9_]+Exception)\b')
+    exceptionCount = {}
+
+    try:
+        with open(logFilePath) as logFile:
+            for logEntry in logFile:
+                foundExceptions = exceptionRegularExpression.findall(logEntry)
+                for singleException in foundExceptions:
+                    if singleException in exceptionCount:
+                        exceptionCount[singleException] += 1
+                    else:
+                        exceptionCount[singleException] = 1
+        print("Info: Exceptions counted successfully")
+        createJIRA(exceptionCount)
+    except Exception as e:
+        print(f"Error: Failed to read and process log file. Reason: {e}")
+
+def createJIRA(exceptionCount):
+    tableHeader = "|| *Exception Name* || *Exception Count* ||\n"
+    tableRows = ''.join(f"| {key} | {value} |\n" for key, value in exceptionCount.items())
+    tableMarkdown = tableHeader + tableRows
+
+    try:
+        base_url = os.environ.get('base_url')
+        accountId = os.environ.get('accountId')
+        email = os.environ.get('email')
+        api_token = os.environ.get('api_token')
+        
+        project = "KAN"
+        taskname = f"Exception Report for {project} on {datetime.now().strftime('%d-%B-%Y')}"
+        
+        url = f"{base_url}rest/api/2/issue"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "fields": {
+                "project": {
+                    "key": project
+                },
+                "assignee": {
+                    "accountId": accountId
+                },
+                "summary": taskname,
+                "description": tableMarkdown,
+                "issuetype": {
+                    "name": "Task"
+                }
+            }
+        }
+        
+        json_payload = json.dumps(payload)
+        
+        response = requests.post(
+            url,
+            headers=headers,
+            data=json_payload,
+            auth=HTTPBasicAuth(email, api_token)
+        )
+        
+        if response.status_code == 201:
+            issueAPIurl = response.json()['self']
+            fullresponse = requests.get(
+                issueAPIurl,
+                headers=headers,
+                auth=HTTPBasicAuth(email, api_token)
+            )
+            if fullresponse.status_code == 200:
+                fullDetails = fullresponse.json()
+                jirakey = fullDetails['key']
+                
+                notificationMessage = f"JIRA has been created. Go to: <{base_url}browse/{jirakey}|{jirakey}>"
+                sendNotification(notificationMessage)
+            else:
+                notificationMessage = "Failed to fetch the JIRA issue details"
+                sendNotification(notificationMessage)
+        else:
+            error_message = response.json().get('errorMessages', 'No error message provided')
+            
+            notificationMessage = f"Failed to create the JIRA issue. Response code: {response.status_code}. Error: {error_message}"
+            
+            sendNotification(notificationMessage)
+    
+    except Exception as error:
+        notificationMessage = f"Failed to create the JIRA issue. Reason: {error}"
+        sendNotification(notificationMessage)
+
+
+
+def sendNotification(notificationMessage):
+    try:
+        messageurl = os.environ.get('messageURL')
+        messageheaders = {
+            'Content-type': 'application/json'
+        }
+        messagedata = {
+            "text": notificationMessage
+        }
+        
+        response = requests.post(messageurl, headers=messageheaders, data=json.dumps(messagedata))
+        
+        if response.status_code == 200:
+            print("Info: Notification sent successfully")
+        else:
+            print(f"Error: Failed to send notification. Response Code: {response.status_code}, Response Text: {response.text}")
+    
+    except Exception as e:
+        print(f"Error: Failed to send notification. Reason: {e}")
+
+
+def lambda_handler(event, context):
+    bucketName = event['detail']['bucket']['name']
+    logFileName = event['detail']['object']['key']
+    
+
+    extractingTarFile(logFileName, bucketName)
